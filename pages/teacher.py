@@ -125,3 +125,100 @@ else:
 
     with chart_col1:
         st.subheader("📉 문항별 정답률 비교")
+        q_stats = pd.DataFrame({
+            "문항": ["문제 1 (온도)", "문제 2 (보일)", "문제 3 (열이동)"],
+            "정답률": [df["Q1_정답"].mean(), df["Q2_정답"].mean(), df["Q3_정답"].mean()]
+        })
+        
+        bar_chart = alt.Chart(q_stats).mark_bar().encode(
+            x=alt.X("문항", sort=None),
+            y=alt.Y("정답률", axis=alt.Axis(format='%', title='정답률')),
+            color=alt.Color("문항", legend=None),
+            tooltip=[alt.Tooltip("문항"), alt.Tooltip("정답률", format=".1%")]
+        ).properties(height=300)
+        
+        st.altair_chart(bar_chart, use_container_width=True)
+
+    with chart_col2:
+        st.subheader("🏆 학생 점수 분포")
+        score_counts = df["총점"].value_counts().reset_index()
+        score_counts.columns = ["점수", "학생수"]
+        
+        pie_chart = alt.Chart(score_counts).mark_arc(innerRadius=50).encode(
+            theta=alt.Theta(field="학생수", type="quantitative"),
+            color=alt.Color(field="점수", type="nominal", legend=alt.Legend(title="맞춘 개수")),
+            tooltip=["점수", "학생수"]
+        ).properties(height=300)
+        
+        st.altair_chart(pie_chart, use_container_width=True)
+    
+    # 분석 멘트
+    min_idx = q_stats['정답률'].idxmin()
+    hardest_q = q_stats.loc[min_idx, '문항']
+    hardest_val = q_stats.loc[min_idx, '정답률'] * 100
+    
+    st.info(f"💡 분석: 학생들이 가장 어려워한 문제는 **'{hardest_q}'** 입니다. (정답률: {hardest_val:.1f}%)")
+
+    st.markdown("---")
+
+    # [하단] 상세 데이터 테이블
+    st.subheader("📋 상세 제출 현황")
+    
+    search_query = st.text_input("🔍 학번 검색", placeholder="학번 입력")
+    if search_query:
+        filtered_df = df[df['student_id'].str.contains(search_query, na=False)]
+    else:
+        filtered_df = df
+
+    # 표시용 데이터프레임 생성
+    display_df = filtered_df.copy()
+    for col in ["Q1_정답", "Q2_정답", "Q3_정답"]:
+        display_df[col] = display_df[col].apply(lambda x: "✅" if x == 1 else "❌")
+
+    st.dataframe(
+        display_df, 
+        use_container_width=True,
+        column_order=["student_id", "created_at", "Q1_정답", "Q2_정답", "Q3_정답", "총점"],
+        column_config={
+            "student_id": "학번",
+            "created_at": "제출 시간",
+            "Q1_정답": "문제 1",
+            "Q2_정답": "문제 2",
+            "Q3_정답": "문제 3",
+            "총점": "점수"
+        }
+    )
+
+    # 엑셀 다운로드
+    csv = filtered_df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button(
+        label="📥 전체 데이터(분석 포함) CSV 다운로드",
+        data=csv,
+        file_name="student_analysis.csv",
+        mime="text/csv",
+    )
+
+    # ── 6. 개별 상세 보기 ──
+    with st.expander("🔎 학생별 피드백 상세 보기"):
+        student_list = filtered_df['student_id'].unique()
+        if len(student_list) > 0:
+            selected_student_detail = st.selectbox("학생 선택", student_list)
+            if selected_student_detail:
+                # 선택한 학생 데이터 필터링
+                student_rows = filtered_df[filtered_df['student_id'] == selected_student_detail]
+                if not student_rows.empty:
+                    student_data = student_rows.iloc[0]
+                    st.markdown(f"### 🧑‍🎓 {student_data['student_id']} 학생 상세 결과")
+                    
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        st.caption("문제 1 (온도)")
+                        st.write(student_data.get("feedback_1", "-"))
+                    with c2:
+                        st.caption("문제 2 (보일)")
+                        st.write(student_data.get("feedback_2", "-"))
+                    with c3:
+                        st.caption("문제 3 (열이동)")
+                        st.write(student_data.get("feedback_3", "-"))
+        else:
+            st.write("표시할 학생 데이터가 없습니다.")
