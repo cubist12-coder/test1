@@ -1,202 +1,168 @@
-"""
-교사용 대시보드 - teacher.py (Supabase 버전)
-─────────────────────────────────────────────────────────────────
-• student_submissions 테이블 실시간 모니터링
-• "새로고침" 버튼 → 최신 데이터 즉시 갱신
-• 학번(부분) 검색, 최근 N일 필터, CSV 다운로드
-• (추가) 통계: 총 제출 수, 고유 학생 수, 문항별 O 비율
-• (추가) 개인별 피드백 조회: 특정 학번의 제출 이력 확인
-"""
-
 import streamlit as st
 import pandas as pd
 from supabase import create_client, Client
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+import pytz # 시간대 변환을 위한 라이브러리
 
-# UI 레이아웃
-st.set_page_config(page_title="교사용 대시보드", layout="wide") 
+# ── 1. 페이지 설정 ──
+st.set_page_config(page_title="교사용 대시보드", layout="wide")
 
-# [추가] 간단한 비밀번호 보호 기능
-password = st.sidebar.text_input("교사 인증 암호", type="password")
-if password != "1234":  # 원하는 비밀번호로 변경하세요
-    st.warning("선생님만 접근할 수 있습니다.")
-    st.stop()  # 암호가 틀리면 여기서 코드 실행 중단
-
-# =========================================================
-# 1) Supabase 연결 (MySQL의 init_db() 대응)
-# =========================================================
+# ── 2. Supabase 연결 설정 (캐싱) ──
 @st.cache_resource
 def get_supabase_client() -> Client:
-    url = st.secrets["SUPABASE_URL"]
-    key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]  # 교사용 로컬 대시보드: 서버/로컬에만 보관
-    return create_client(url, key)
-
-# =========================================================
-# 2) 데이터 로드 (MySQL의 fetch_data(query, params) 대응)
-#    - Supabase는 SQL 문자열 대신 "쿼리 빌더 체이닝" 사용
-# =========================================================
-@st.cache_data(show_spinner=False, ttl=30)
-def fetch_data(search_id: str, days: int) -> pd.DataFrame:
     try:
-        supabase = get_supabase_client()
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_SERVICE_ROLE_KEY"]
+        return create_client(url, key)
+    except Exception:
+        st.error("Secrets 설정이 누락되었습니다. (.streamlit/secrets.toml 확인)")
+        st.stop()
 
-        # 컬럼 선택: 필요시 guideline_1~3, model도 추가 가능
-        q = (
-            supabase.table("student_submissions")
-            .select(
-                "id, student_id, answer_1, answer_2, answer_3, "
-                "feedback_1, feedback_2, feedback_3, model, created_at"
-            )
-        )
+supabase = get_supabase_client()
 
-        # 학번 부분 검색 (대소문자 무시 검색)
-        if search_id:
-            q = q.ilike("student_id", f"%{search_id}%")
+# ── 3. 간단한 로그인 (비밀번호 보호) ──
+# 실제 배포 시에는 secrets.toml에 ADMIN_PASSWORD를 설정하는 것을 권장합니다.
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "1234") # 기본값 1234 (설정 필요)
 
-        # 최근 N일 필터 (created_at 기준)
-        if days and days > 0:
-            date_from = datetime.now(timezone.utc) - timedelta(days=int(days))
-            q = q.gte("created_at", date_from.isoformat())
+if "is_authenticated" not in st.session_state:
+    st.session_state.is_authenticated = False
 
-        # 최신순 정렬
-        q = q.order("created_at", desc=True)
+def check_password():
+    if st.session_state.password_input == ADMIN_PASSWORD:
+        st.session_state.is_authenticated = True
+    else:
+        st.error("비밀번호가 틀렸습니다.")
 
-        res = q.execute()
-        rows = res.data or []
-        df = pd.DataFrame(rows)
+if not st.session_state.is_authenticated:
+    st.title("🔒 교사용 대시보드 로그인")
+    st.text_input("비밀번호를 입력하세요", type="password", key="password_input", on_change=check_password)
+    st.stop() # 인증 전에는 아래 코드 실행 중단
 
-        # created_at을 datetime으로 변환(통계/정렬에 유용)
-        if not df.empty and "created_at" in df.columns:
-            df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
+# =========================================================
+# 로그인 성공 시 아래 내용 표시
+# =========================================================
 
-        return df
+st.title("📊 학생 서술형 답안 대시보드")
 
-    except Exception as e:
-        # RLS/키/테이블명 문제 등은 여기로 잡힙니다.
-        st.error(f"Supabase 조회 오류: {e}")
+# ── 4. 데이터 불러오기 및 가공 ──
+@st.cache_data(ttl=60) # 60초마다 데이터 갱신 허용
+def fetch_data():
+    # created_at 기준 내림차순 정렬 (최신순)
+    response = supabase.table("student_submissions").select("*").order("created_at", desc=True).execute()
+    rows = response.data
+    
+    if not rows:
         return pd.DataFrame()
 
-@st.cache_data(show_spinner=False, ttl=30)
-def fetch_student_history(student_id: str, limit: int = 200) -> pd.DataFrame:
-    """특정 학번의 제출 이력을 별도로 조회(개인별 피드백 조회용)."""
-    try:
-        supabase = get_supabase_client()
-        q = (
-            supabase.table("student_submissions")
-            .select(
-                "id, student_id, answer_1, answer_2, answer_3, "
-                "feedback_1, feedback_2, feedback_3, model, created_at"
-            )
-            .eq("student_id", student_id)
-            .order("created_at", desc=True)
-            .limit(limit)
-        )
-        res = q.execute()
-        rows = res.data or []
-        df = pd.DataFrame(rows)
-        if not df.empty and "created_at" in df.columns:
-            df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce")
-        return df
-    except Exception as e:
-        st.error(f"개인 이력 조회 오류: {e}")
-        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    
+    # 시간대 변환 (UTC -> KST)
+    if "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"])
+        # DB에 저장된 시간이 UTC라고 가정하고 한국 시간으로 변환
+        df["created_at"] = df["created_at"].dt.tz_convert("Asia/Seoul").dt.strftime("%Y-%m-%d %H:%M:%S")
+        
+    return df
 
-# =========================================================
-# 3) UI 레이아웃
-# =========================================================
-st.title("📊 대시보드 — 서술형 평가 (Supabase)")
+# 새로고침 버튼
+if st.button("🔄 데이터 새로고침"):
+    fetch_data.clear() # 캐시 초기화
+    st.rerun()
 
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
-    search_id = st.text_input("학번 검색 (부분 가능)", value="")
-with col2:
-    days = st.number_input("최근 N일", min_value=0, max_value=365, value=30, step=1)
-with col3:
-    if st.button("🔄 새로고침"):
-        st.cache_data.clear()
+df = fetch_data()
 
-df = fetch_data(search_id=search_id.strip(), days=int(days))
-
-# =========================================================
-# 4) 상단 통계(전체/학생 수/문항별 O 비율)
-# =========================================================
-st.write(f"**총 {len(df)} 건** 표시 중")
-
+# ── 5. 통계 및 메인 테이블 표시 ──
 if df.empty:
-    st.info("조건에 해당하는 데이터가 없습니다.")
+    st.warning("아직 제출된 데이터가 없습니다.")
 else:
-    unique_students = df["student_id"].nunique() if "student_id" in df.columns else 0
-    latest_time = df["created_at"].max() if "created_at" in df.columns else None
+    # (1) 요약 통계
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("총 제출 수", f"{len(df)}건")
+    with col2:
+        recent_student = df.iloc[0]['student_id']
+        st.metric("최근 제출 학생", recent_student)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("총 제출 수", f"{len(df)}")
-    c2.metric("고유 학생 수", f"{unique_students}")
-    c3.metric("최신 제출", f"{latest_time}" if latest_time is not None else "-")
-
-    # 문항별 정답(O) 비율 (feedback_i가 "O:"로 시작하는 비율)
-    def o_rate(series: pd.Series) -> float:
-        if series is None or series.empty:
-            return 0.0
-        s = series.fillna("").astype(str)
-        return (s.str.startswith("O:").sum() / len(s)) * 100.0
-
-    r1 = o_rate(df.get("feedback_1"))
-    r2 = o_rate(df.get("feedback_2"))
-    r3 = o_rate(df.get("feedback_3"))
-
-    st.markdown("#### ✅ 문항별 O 비율(전체 표시 범위 기준)")
-    s1, s2, s3 = st.columns(3)
-    s1.metric("문항 1", f"{r1:.1f}%")
-    s2.metric("문항 2", f"{r2:.1f}%")
-    s3.metric("문항 3", f"{r3:.1f}%")
-
-    # =========================================================
-    # 5) 전체 목록 표시 + CSV 다운로드
-    # =========================================================
     st.markdown("---")
-    st.subheader("📄 전체 제출 목록")
 
-    # 화면 가독성을 위해 컬럼 순서 정리
-    show_cols = [
-        "student_id", "created_at",
-        "answer_1", "answer_2", "answer_3",
-        "feedback_1", "feedback_2", "feedback_3",
-        "model"
-    ]
-    show_cols = [c for c in show_cols if c in df.columns]
-    st.dataframe(df[show_cols], use_container_width=True, hide_index=True)
+    # (2) 데이터 필터링 (학번 검색)
+    search_query = st.text_input("🔍 학번 검색", placeholder="학번을 입력하세요 (모두 보려면 비워두세요)")
+    
+    if search_query:
+        filtered_df = df[df['student_id'].str.contains(search_query)]
+    else:
+        filtered_df = df
 
-    csv = df[show_cols].to_csv(index=False).encode("utf-8-sig")
+    # (3) 메인 데이터프레임 (요약 보기용 컬럼만 선택)
+    display_cols = ["student_id", "created_at", "answer_1", "feedback_1"] # 주요 컬럼만 미리보기
+    st.subheader("📋 제출 현황 목록")
+    st.dataframe(
+        filtered_df, 
+        use_container_width=True,
+        column_config={
+            "student_id": "학번",
+            "created_at": "제출 시간",
+            "answer_1": "Q1 답안 (요약)",
+            "feedback_1": "Q1 피드백 (요약)"
+        }
+    )
+
+    # (4) 엑셀 다운로드 버튼
+    csv = filtered_df.to_csv(index=False).encode('utf-8-sig') # 한글 깨짐 방지
     st.download_button(
-        "📥 CSV 다운로드",
-        csv,
+        label="📥 전체 데이터 CSV로 다운로드",
+        data=csv,
         file_name="student_submissions.csv",
         mime="text/csv",
     )
 
-    # =========================================================
-    # 6) 개인별 피드백 조회
-    # =========================================================
+    # ── 6. 상세 보기 (Expandable) ──
     st.markdown("---")
-    st.subheader("🔎 개인별 피드백 조회")
+    st.subheader("📝 학생별 상세 답안 및 피드백 확인")
+    
+    # 선택박스로 학생 선택
+    student_list = filtered_df['student_id'].unique()
+    selected_student = st.selectbox("상세 내용을 확인할 학생을 선택하세요", student_list)
 
-    # 현재 필터 범위 내 학생 목록에서 선택(원하면 직접 입력으로 바꿔도 됨)
-    student_list = sorted(df["student_id"].dropna().astype(str).unique().tolist())
-    selected = st.selectbox("학번 선택", options=student_list)
+    if selected_student:
+        # 해당 학생의 데이터 추출 (중복 제출 시 최신 것 1개만 가져오거나 리스트로 보여줌)
+        # 여기서는 최신 1건만 보여주는 예시
+        student_data = filtered_df[filtered_df['student_id'] == selected_student].iloc[0]
 
-    if selected:
-        history = fetch_student_history(selected, limit=200)
-        st.write(f"**{selected} 제출 이력: {len(history)}건**")
+        with st.container(border=True):
+            st.markdown(f"### 🧑‍🎓 학번: {student_data['student_id']}")
+            st.caption(f"제출 시간: {student_data['created_at']}")
+            
+            # 문항별 탭 생성
+            tab1, tab2, tab3 = st.tabs(["문제 1 (온도)", "문제 2 (보일)", "문제 3 (열이동)"])
+            
+            with tab1:
+                st.markdown("**학생 답안:**")
+                st.info(student_data.get("answer_1", "-"))
+                st.markdown("**AI 피드백:**")
+                # O/X에 따른 색상 구분
+                fb = student_data.get("feedback_1", "")
+                if fb.startswith("O:"):
+                    st.success(fb)
+                else:
+                    st.warning(fb)
 
-        if history.empty:
-            st.info("이 학번의 이력이 없습니다.")
-        else:
-            hist_cols = [
-                "created_at",
-                "answer_1", "feedback_1",
-                "answer_2", "feedback_2",
-                "answer_3", "feedback_3",
-                "model",
-            ]
-            hist_cols = [c for c in hist_cols if c in history.columns]
-            st.dataframe(history[hist_cols], use_container_width=True, hide_index=True)
+            with tab2:
+                st.markdown("**학생 답안:**")
+                st.info(student_data.get("answer_2", "-"))
+                st.markdown("**AI 피드백:**")
+                fb = student_data.get("feedback_2", "")
+                if fb.startswith("O:"):
+                    st.success(fb)
+                else:
+                    st.warning(fb)
+
+            with tab3:
+                st.markdown("**학생 답안:**")
+                st.info(student_data.get("answer_3", "-"))
+                st.markdown("**AI 피드백:**")
+                fb = student_data.get("feedback_3", "")
+                if fb.startswith("O:"):
+                    st.success(fb)
+                else:
+                    st.warning(fb)
